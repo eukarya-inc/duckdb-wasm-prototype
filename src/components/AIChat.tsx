@@ -1,11 +1,6 @@
-import { useState, useRef, useEffect } from 'react';
-import Anthropic from '@anthropic-ai/sdk';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import { type AsyncDuckDB } from '@duckdb/duckdb-wasm';
-
-interface Message {
-    role: 'user' | 'assistant';
-    content: string;
-}
+import { createTaskLoop, type Message, type TaskLoopFunction } from '../lib/TaskLoop';
 
 interface AIChatProps {
     db: AsyncDuckDB;
@@ -22,6 +17,22 @@ export default function AIChat({ db }: AIChatProps) {
 
     const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY;
 
+    // Create TaskLoop instance with memoization
+    const taskLoop = useMemo(() => {
+        if (!apiKey) return null;
+        return createTaskLoop({
+            apiKey: apiKey,
+            model: 'claude-3-5-sonnet-20241022',
+            maxTokens: 1000,
+        });
+    }, [apiKey]);
+
+    // Create the task loop function
+    const executeTaskLoop: TaskLoopFunction | null = useMemo(() => {
+        if (!taskLoop) return null;
+        return taskLoop.createTaskLoop();
+    }, [taskLoop]);
+
     const scrollToBottom = () => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     };
@@ -31,7 +42,7 @@ export default function AIChat({ db }: AIChatProps) {
     }, [messages, streamingMessage]);
 
     const sendMessage = async () => {
-        if (!input.trim() || !apiKey) return;
+        if (!input.trim() || !apiKey || !executeTaskLoop) return;
 
         const userMessage: Message = { role: 'user', content: input };
         const currentInput = input;
@@ -42,43 +53,34 @@ export default function AIChat({ db }: AIChatProps) {
         setStreamingMessage('');
 
         try {
-            const anthropic = new Anthropic({
-                apiKey: apiKey,
-                dangerouslyAllowBrowser: true // プロトタイプなのでブラウザから直接呼び出し
-            });
-
-            const stream = await anthropic.messages.stream({
-                model: 'claude-3-5-sonnet-20241022',
-                max_tokens: 1000,
-                messages: [
-                    ...messages.map(msg => ({
-                        role: msg.role,
-                        content: msg.content
-                    })),
-                    { role: 'user', content: currentInput }
-                ]
-            });
-
-            let fullContent = '';
-            
-            for await (const chunk of stream) {
-                if (chunk.type === 'content_block_delta' && chunk.delta.type === 'text_delta') {
-                    fullContent += chunk.delta.text;
-                    setStreamingMessage(fullContent);
+            await executeTaskLoop(currentInput, {
+                onStreamUpdate: (content: string) => {
+                    setStreamingMessage(content);
+                },
+                onComplete: (content: string) => {
+                    const assistantMessage: Message = {
+                        role: 'assistant',
+                        content: content || 'エラーが発生しました'
+                    };
+                    setMessages(prev => [...prev, assistantMessage]);
+                    setStreamingMessage('');
+                    setIsStreaming(false);
+                    setLoading(false);
+                },
+                onError: (error: Error) => {
+                    console.error('TaskLoop Error:', error);
+                    const errorMessage: Message = {
+                        role: 'assistant',
+                        content: 'エラーが発生しました。APIキーが正しく設定されているか確認してください。'
+                    };
+                    setMessages(prev => [...prev, errorMessage]);
+                    setStreamingMessage('');
+                    setIsStreaming(false);
+                    setLoading(false);
                 }
-            }
-
-            // ストリーミング完了後、最終メッセージを追加
-            const assistantMessage: Message = {
-                role: 'assistant',
-                content: fullContent || 'エラーが発生しました'
-            };
-
-            setMessages(prev => [...prev, assistantMessage]);
-            setStreamingMessage('');
-            setIsStreaming(false);
+            });
         } catch (error) {
-            console.error('AI API Error:', error);
+            console.error('Unexpected error:', error);
             const errorMessage: Message = {
                 role: 'assistant',
                 content: 'エラーが発生しました。APIキーが正しく設定されているか確認してください。'
@@ -86,9 +88,8 @@ export default function AIChat({ db }: AIChatProps) {
             setMessages(prev => [...prev, errorMessage]);
             setStreamingMessage('');
             setIsStreaming(false);
+            setLoading(false);
         }
-
-        setLoading(false);
     };
 
     const handleKeyPress = (e: React.KeyboardEvent) => {
@@ -98,7 +99,7 @@ export default function AIChat({ db }: AIChatProps) {
         }
     };
 
-    if (!apiKey) {
+    if (!apiKey || !executeTaskLoop) {
         return (
             <div style={{
                 padding: '20px',
